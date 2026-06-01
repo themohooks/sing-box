@@ -1,0 +1,228 @@
+name: Build Libraries for Flutter
+
+on:
+  push:
+    branches: [main, master, stable, testing]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Platform to build"
+        required: false
+        type: choice
+        default: "All"
+        options:
+          - All
+          - Android
+          - Apple
+          - Windows
+          - Linux
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  calculate_version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.outputs.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.10
+      - name: Calculate version
+        run: |-
+          go run -v ./cmd/internal/read_tag --ci --nightly
+      - name: Set outputs
+        id: outputs
+        run: |-
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build_android:
+    name: Build Android library
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'All' || inputs.platform == 'Android'
+    runs-on: ubuntu-latest
+    needs: calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.10
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+          local-cache: true
+      - name: Setup OpenJDK
+        run: |-
+          sudo apt-get update && sudo apt-get install -y openjdk-17-jdk-headless
+      - name: Set tag
+        run: |-
+          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Install gomobile
+        run: |-
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          which gomobile
+      - name: Build libbox.aar
+        run: |-
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make lib_android
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-android
+          path: |
+            libbox.aar
+            libbox-legacy.aar
+
+  build_apple:
+    name: Build Apple library (iOS/macOS)
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'All' || inputs.platform == 'Apple'
+    runs-on: macos-latest
+    needs: calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.10
+      - name: Set tag
+        run: |-
+          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Install gomobile
+        run: |-
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          which gomobile
+      - name: Build Libbox.xcframework
+        run: |-
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make lib_apple
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-apple
+          path: Libbox.xcframework
+
+  build_windows:
+    name: Build Windows library
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'All' || inputs.platform == 'Windows'
+    runs-on: windows-latest
+    needs: calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.10
+      - name: Set tag
+        run: |-
+          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$env:GITHUB_ENV"
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Build shared library
+        run: |
+          $TAGS = Get-Content release/DEFAULT_BUILD_TAGS_WINDOWS
+          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
+          mkdir -p dist
+          go build -buildmode=c-shared `
+            -v -trimpath -o dist/box.dll -tags "$TAGS" `
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" `
+            ./experimental/libbox
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-windows
+          path: dist/*
+
+  build_linux:
+    name: Build Linux library
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'All' || inputs.platform == 'Linux'
+    runs-on: ubuntu-latest
+    needs: calculate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.10
+      - name: Install dependencies
+        run: |-
+          sudo apt-get update
+          sudo apt-get install -y gcc pkg-config
+      - name: Set tag
+        run: |-
+          git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
+          git tag v${{ needs.calculate_version.outputs.version }} -f
+      - name: Build shared library
+        run: |
+          TAGS=$(cat release/DEFAULT_BUILD_TAGS)
+          LDFLAGS_SHARED=$(cat release/LDFLAGS)
+          mkdir -p dist
+          go build -buildmode=c-shared \
+            -v -trimpath -o dist/libbox.so -tags "${TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./experimental/libbox
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbox-linux
+          path: dist/*
+
+  publish:
+    name: Publish libraries
+    if: "!failure() && github.event_name == 'workflow_dispatch'"
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+      - build_android
+      - build_apple
+      - build_windows
+      - build_linux
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: find dist -type f | head -50
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |-
+          echo "Upload to release: dist/*"
